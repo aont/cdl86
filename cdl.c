@@ -82,7 +82,9 @@
 #endif
 #else
 /* Check other compilers */
-#if __x86_64__
+#if defined(__aarch64__)
+#define ARCH_AARCH64
+#elif defined(__x86_64__)
 #define ENV_64
 #else
 #define ENV_32
@@ -90,18 +92,22 @@
 #endif
 
 /* Set ARCH flags */
-#ifdef ENV_64
+#ifdef ARCH_AARCH64
+#define BYTES_JMP_PATCH 16
+#define BYTES_SWBP_PATCH 4
+#define PTR_SIZE PRIx64
+#elif defined(ENV_64)
 #define REG_IP REG_RIP
 #define BYTES_JMP_PATCH 12
+#define BYTES_SWBP_PATCH 1
 #define PTR_SIZE PRIx64
 #else
 #define REG_IP REG_EIP
 #define BYTES_JMP_PATCH 5
+#define BYTES_SWBP_PATCH 1
 #define PTR_SIZE PRIx32
 #endif
 
-/* Define SW BP patch length, see (cdl_gen_swbp) */
-#define BYTES_SWBP_PATCH 1
 
 /* General : reserve bytes */
 #define BYTES_RESERVE_MAX 20
@@ -366,6 +372,12 @@ static uint8_t* cdl_gen_64_jmp(
     __in uint8_t* address
 )
 {
+#ifdef ARCH_AARCH64
+    /* ldr x16, 8; br x16; .quad address */
+    *(uint32_t*)(code + 0x0) = 0x58000050;
+    *(uint32_t*)(code + 0x4) = 0xD61F0200;
+    *(uint64_t*)(code + 0x8) = (uint64_t)address;
+#else
     /* Generate 'mov rax', address */
     *(code + 0x0) = 0x48;
     *(code + 0x1) = 0xB8;
@@ -373,7 +385,7 @@ static uint8_t* cdl_gen_64_jmp(
     /* Generate 'jmpq *%rax' instruction. */
     *(code + 0xA) = 0xFF;
     *(code + 0xB) = 0xE0;
-
+#endif
     return code;
 }
 
@@ -395,7 +407,11 @@ static uint8_t* cdl_gen_nop(
     __in uint8_t* code
 )
 {
+#ifdef ARCH_AARCH64
+    *(uint32_t*)code = 0xD503201F; /* nop */
+#else
     *(code + 0x0) = 0x90;
+#endif
     return code;
 }
 
@@ -403,7 +419,11 @@ static uint8_t* cdl_gen_swbp(
     __in uint8_t* code
 )
 {
+#ifdef ARCH_AARCH64
+    *(uint32_t*)code = 0xD4200000; /* brk #0 */
+#else
     *(code + 0x0) = 0xCC;
+#endif
     return code;
 }
 
@@ -435,7 +455,7 @@ static uint8_t* cdl_gen_trampoline(
     /* Generate jump to address just after call
      * to detour in trampoline. */
 
-    #ifdef ENV_64
+    #if defined(ARCH_AARCH64) || defined(ENV_64)
 
     cdl_gen_64_jmp(trampoline + size, target + size);
 
@@ -465,11 +485,15 @@ static uint8_t* cdl_reserve_bytes(
     {
         return (uint8_t*)NULL;
     }
-    /* Allocate buffer to hold original instruction
-     * bytes.
-     */
+    /* Allocate buffer to hold original instruction bytes. */
     bytes_orig = (uint8_t*)malloc(BYTES_RESERVE_MAX);
-    /* Prove instructions until bytes > reserve. */
+
+#ifdef ARCH_AARCH64
+    /* Instructions are fixed width so copy the requested bytes. */
+    memcpy(bytes_orig, target, reserve);
+    bytes = reserve;
+#else
+    /* Probe instructions until bytes > reserve. */
     while (bytes < reserve)
     {
         probe = cdl_asm_probe(target + bytes);
@@ -477,6 +501,7 @@ static uint8_t* cdl_reserve_bytes(
         bytes += probe.size;
         free(probe.bytes);
     };
+#endif
 
     *alloc_size = bytes;
     /* Return original instruction bytes.
@@ -495,12 +520,13 @@ static void cdl_nop_fill(
     __in int patch_size
 )
 {
-    int nops = 0x0;
-
-    nops = size - patch_size;
-    while (nops-- > 0)
+    int step = 1;
+#ifdef ARCH_AARCH64
+    step = 4;
+#endif
+    for (int off = patch_size; off < size; off += step)
     {
-        cdl_gen_nop(target + patch_size + nops);
+        cdl_gen_nop(target + off);
     }
 
     return;
@@ -580,10 +606,14 @@ static void cdl_swbp_handler_linux(
     int i = 0x0;
     bool active = false;
     uint8_t* bp_addr = NULL;
-    /* RIP register point to instruction after the
-     * int3 breakpoint so we subtract 0x1.
+    /* Program counter points to instruction after the
+     * breakpoint so subtract patch size.
      */
+#ifdef ARCH_AARCH64
+    bp_addr = (uint8_t*)(context->uc_mcontext.pc - BYTES_SWBP_PATCH);
+#else
     bp_addr = (uint8_t*)(context->uc_mcontext.gregs[REG_IP] - 0x1);
+#endif
 
     /* Iterate over all breakpoint structs. */
     for (i = 0; i < cdl_swbp_size; i++)
@@ -592,8 +622,12 @@ static void cdl_swbp_handler_linux(
         /* Compare breakpoint addresses. */
         if (bp_addr == cdl_swbp_hk[i].bp_addr && active)
         {
-            /* Update RIP and reset context. */
+            /* Update program counter and reset context. */
+#ifdef ARCH_AARCH64
+            context->uc_mcontext.pc = (uint64_t)cdl_swbp_hk[i].detour;
+#else
             context->uc_mcontext.gregs[REG_IP] = (greg_t)cdl_swbp_hk[i].detour;
+#endif
             setcontext(context);
         }
     }
@@ -638,7 +672,7 @@ struct cdl_jmp_patch cdl_jmp_attach(
 
     /* Generate JMP to detour function. */
 
-    #ifdef ENV_64
+    #if defined(ARCH_AARCH64) || defined(ENV_64)
 
     cdl_gen_64_jmp(target_origin, (uint8_t*)detour);
 

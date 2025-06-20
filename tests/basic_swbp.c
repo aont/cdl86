@@ -1,3 +1,5 @@
+#include <stddef.h>
+#include <stdio.h>
 #include "cdl.h"
 
 typedef int add_t(
@@ -50,3 +52,4 @@ int main(
 
     return 0;
 }
+
